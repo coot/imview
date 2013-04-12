@@ -1,0 +1,309 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+# Options:
+MAXFILLSCREENRATIO = 0.9 # it must be a float number.
+MULTIPROCESSING = False
+
+
+import os
+import sys
+import os.path
+import pyglet
+from optparse import OptionParser
+if MULTIPROCESSING:
+    import multiprocessing
+# import Xlib.display
+
+if not hasattr(os, 'EX_OK'):
+    os.EX_OK=0
+
+usage = "%prog [options] {files}"
+parser  = OptionParser(usage=usage)
+parser.add_option("-D", "--no-daemon", dest="daemon", default=True,
+        action="store_false", help="do not run in background")
+parser.add_option("--debug_gl", dest="debug_gl", default=False,
+        action="store_true", help="pyglet DEBUG_GL option")
+(options, args) = parser.parse_args()
+
+pyglet.options['debug_gl'] = options.debug_gl
+# XXX: this seems to be slow, it is needed for pyglet.resource.image.
+# XXX: put the window on the middle of the screen: this doesn't work after
+# rotation, maybe my WM is doing something here.
+# Done: set the title (X resources) -> window.set_caption()
+# XXX: save rotated picture to the disk.
+# XXX: fork and load images in a seprate thread (threading is not working).
+#      Also check multiprocessing
+# pyglet.resource.path=[os.path.expandvars('${HOME}/obrazy/')]
+# pyglet.resource.reindex()
+
+def createDaemon():
+    # Detach. 
+    # credits: http://code.activestate.com/recipes/278731-creating-a-daemon-the-python-way/
+    # see ~/python/bin/daemon.py
+
+    # Why two forks: 
+    # It always takes two forks to make a daemon. This is tradition. Some
+    # UNIXes don't require it. It doesn't hurt to do it on all UNIXes. The
+    # reason some UNIXes require it is to make sure that the daemon process
+    # is NOT a session leader. A session leader process may attempt to
+    # aquire a controlling terminal. By definition a daemon does not have
+    # a controlling terminal. This is one of the steps that might not be
+    # strictly necessary, but it will eliminate one possible source for
+    # faults.
+    try:
+        pid = os.fork()
+    except OSError, e:
+        raise Exception, "%s [%d]" % (e.strerror, e.errno)
+    if (pid == 0):
+        os.setsid()
+        import signal
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        try:
+            pid = os.fork()
+        except OSError, e:
+            raise Exception, "%s [%d]" % (e.strerror, e.errno)
+        if (pid == 0):
+            os.umask(0)
+        else:
+            os._exit(os.EX_OK)
+    else:
+        os._exit(os.EX_OK)
+
+    # close all open file descriptors
+    import resource
+    MAXFD = 1024
+    maxfd = resource.getrlimit(resource.RLIMIT_NOFILE)[1]  # maximal number of open file descriptors 
+                                                          # also available through os.sysconf("SC_OPEN_MAX") 
+    if (maxfd == resource.RLIM_INFINITY):
+        maxfd = MAXFD
+    for fd in range(0, maxfd):
+        # Iterate through and close all all file descriptors.
+        try:
+            os.close(fd)
+        except OSError:  # fd wasn't open to begin with
+            pass
+
+    if (hasattr(os, "devnull")):
+        os.open(os.devnull, os.O_RDWR)
+    else:
+        os.open("/dev/null", os.O_RDWR)
+    os.dup2(0,1)
+    os.dup2(0,2)
+
+if options.daemon:
+    createDaemon()
+
+screen=pyglet.window.get_platform().get_default_display().get_screens()[0]
+# screen holds information on the screen width and height. I use it to print
+# the image in the center of the first screen.
+
+class SpriteList(object):
+    """
+    XXX: it should load all the images on startup using another thread.
+    Then send them back when each one is loaded. What takes time is:
+    pyglet.sprite.Sprite(image).
+    """
+    def __init__(self, files=[]):
+        self.ind = 0
+        self.files = files
+        self.sprite_dict = {}
+
+
+        # NOTE: sprite is a ctype object which contains pointers -> cannot be
+        # pickled and thus cannot be send through a multiprocessing.Manager()
+        # ValueError: ctypes objects containing pointers cannot be pickled
+        if MULTIPROCESSING:
+            mgr = multiprocessing.Manager()
+            self.sprite_dict_mgr = mgr.dict()
+            def get_sprites(files, sprite_dict):
+                for file in files:
+                    image = pyglet.image.load(file)
+                    sprite = pyglet.sprite.Sprite(image)
+                    sprite.x_ratio = float(sprite.image.width)/screen.width
+                    sprite.y_ratio = float(sprite.image.height)/screen.height
+                    if max(sprite.x_ratio, sprite.y_ratio) > MAXFILLSCREENRATIO:
+                        sprite.scale=MAXFILLSCREENRATIO/max(sprite.x_ratio, sprite.y_ratio)
+                    sprite.image.anchor_x = sprite.image.width//2 #!!! ANCHOR MUST BE SET ACCORDING TO IMAGE SIZE.
+                    sprite.image.anchor_y = sprite.image.height//2
+                    sprite.x = sprite.width//2
+                    sprite.y = sprite.height//2
+                    sprite_dict[file]=sprite
+
+            thread = multiprocessing.Process(target=get_sprites,
+                    args=(self.files,self.sprite_dict_mgr))
+            thread.start()
+
+    def get_filename(self):
+        return self.files[self.ind]
+
+    def __getitem__(self, item):
+        if len(self.files) == 0:
+            sys.exit(os.EX_OK)
+        file = self.files[item]
+        if file in self.sprite_dict.keys():
+            self.ind = item
+            return self.sprite_dict[file]
+        elif MULTIPROCESSING and file in self.sprite_dict_mgr.keys():
+            self.ind = item
+            self.sprite_dict[file]=self.sprite_dict_mgr[file]
+            return self.sprite_dict_mgr[file]
+        else:
+            try:
+                image = pyglet.image.load(file)
+            except pyglet.image.codecs.ImageDecodeException as e:
+                print("ImView Error: %s" % e)
+                del self.files[item]
+                if item >= self.ind:
+                    if item < len(self.files):
+                        return self.__getitem__(item)
+                    else:
+                        return self.__getitem__(0)
+                else:
+                    if item > 0:
+                        return self.__getitem__(item-1)
+                    else:
+                        return self.__getitem__(len(self.files)-1)
+            else:
+                self.ind = item
+                sprite = pyglet.sprite.Sprite(image)
+                sprite.x_ratio = float(sprite.image.width)/screen.width
+                sprite.y_ratio = float(sprite.image.height)/screen.height
+                if max(sprite.x_ratio, sprite.y_ratio) > MAXFILLSCREENRATIO:
+                    sprite.scale=MAXFILLSCREENRATIO/max(sprite.x_ratio, sprite.y_ratio)
+                sprite.image.anchor_x = sprite.image.width//2 #!!! ANCHOR MUST BE SET ACCORDING TO IMAGE SIZE.
+                sprite.image.anchor_y = sprite.image.height//2
+                sprite.x = sprite.width//2
+                sprite.y = sprite.height//2
+                self.sprite_dict[file]=sprite
+                return sprite
+
+    def next(self):
+        if self.ind < len(self.files)-1:
+            return self.__getitem__(self.ind+1)
+        else:
+            return self.__getitem__(0)
+
+    def previous(self):
+        if self.ind > 0:
+            return self.__getitem__(self.ind-1)
+        else:
+            return self.__getitem__(len(self.files)-1)
+
+    def current(self):
+        return self.__getitem__(self.ind)
+
+    def first(self):
+        self.ind=0
+        return self.__getitem__(self.ind)
+
+    def last(self):
+        self.ind=len(self.files)-1
+        return self.__getitem__(self.ind)
+
+    def __iter__(self):
+        return iter(self.sprites)
+
+sprite_list = SpriteList(args)
+sprite = sprite_list.current()
+
+window = pyglet.window.Window(width=sprite.width,height=sprite.height)
+x=sprite_list.get_filename()
+window.set_caption("imview: %s" % sprite_list.get_filename().decode("utf8"))
+window.set_location(((screen.width-sprite.width)//2),((screen.height-sprite.height)//2))
+
+@window.event
+def on_draw():
+    global ind
+    window.clear()
+    sprite=sprite_list.current()
+    sprite.draw()
+
+@window.event
+def on_key_press(symbol, modifiers):
+    global ind
+    if not modifiers or modifiers & pyglet.window.key.MOD_NUMLOCK:
+        if len(sprite_list.files) <= 1:
+            return
+        if symbol in ( pyglet.window.key.J, pyglet.window.key.SPACE, pyglet.window.key.ENTER):
+            sprite=sprite_list.next()
+        elif symbol in ( pyglet.window.key.K, pyglet.window.key.BACKSPACE):
+            sprite=sprite_list.previous()
+        elif symbol == pyglet.window.key.HOME:
+            sprite=sprite_list.first()
+        elif symbol == pyglet.window.key.END:
+            sprite=sprite_list.last()
+        else:
+            return
+        window.set_caption("imview: %s" % sprite_list.get_filename())
+        (window_width, window_height) = (sprite.width, sprite.height)
+    elif modifiers & pyglet.window.key.MOD_CTRL:
+        if symbol == pyglet.window.key.J:
+            sprite=sprite_list.current()
+            sprite.rotation-=90
+            if sprite.rotation%180: # 90, 270:
+                sprite.x_ratio = float(sprite.image.height)/screen.width
+                sprite.y_ratio = float(sprite.image.width)/screen.height
+                if max(sprite.x_ratio, sprite.y_ratio) > MAXFILLSCREENRATIO:
+                    sprite.scale=MAXFILLSCREENRATIO/max(sprite.x_ratio, sprite.y_ratio)
+                sprite.x = sprite.height//2
+                sprite.y = sprite.width//2
+                (window_width, window_height) = (sprite.height, sprite.width)
+            else: # 0, 180:
+                sprite.x_ratio = float(sprite.image.width)/screen.width
+                sprite.y_ratio = float(sprite.image.height)/screen.height
+                if max(sprite.x_ratio, sprite.y_ratio) > MAXFILLSCREENRATIO:
+                    sprite.scale=MAXFILLSCREENRATIO/max(sprite.x_ratio, sprite.y_ratio)
+                sprite.x = sprite.width//2
+                sprite.y = sprite.height//2
+                (window_width, window_height) = (sprite.width, sprite.height)
+        elif symbol == pyglet.window.key.K:
+            sprite=sprite_list.current()
+            sprite.rotation+=90
+            if sprite.rotation%180: # 90, 270:
+                sprite.x_ratio = float(sprite.image.height)/screen.width
+                sprite.y_ratio = float(sprite.image.width)/screen.height
+                if max(sprite.x_ratio, sprite.y_ratio) > MAXFILLSCREENRATIO:
+                    sprite.scale=MAXFILLSCREENRATIO/max(sprite.x_ratio, sprite.y_ratio)
+                sprite.x = sprite.height//2
+                sprite.y = sprite.width//2
+                (window_width, window_height) = (sprite.height, sprite.width)
+            else: # 0, 180:
+                sprite.x_ratio = float(sprite.image.width)/screen.width
+                sprite.y_ratio = float(sprite.image.height)/screen.height
+                if max(sprite.x_ratio, sprite.y_ratio) > MAXFILLSCREENRATIO:
+                    sprite.scale=MAXFILLSCREENRATIO/max(sprite.x_ratio, sprite.y_ratio)
+                sprite.x = sprite.width//2
+                sprite.y = sprite.height//2
+                (window_width, window_height) = (sprite.width, sprite.height)
+        elif symbol == pyglet.window.key.C:
+            window.close()
+            sys.exit(os.EX_OK)
+        else:
+            return
+        # XXX: sprite should be saved. But rotation modifies only sprite not
+        # the image itself.
+    else:
+        return
+
+    window.clear()
+    window.set_size(window_width, window_height)
+    sprite.draw()
+
+@window.event
+def on_mouse_press(x,y,button,modifiers):
+    if button == pyglet.window.mouse.LEFT:
+        sprite=sprite_list.next()
+    else:
+        sprite=sprite_list.previous()
+    window.clear()
+    window.set_size(sprite.width, sprite.height)
+    window.set_caption("imview: %s" % sprite_list.get_filename())
+    sprite.draw()
+
+try:
+    pyglet.app.run()
+except KeyboardInterrupt:
+    # Gently exit on CTRL+c
+    window.close()
+    sys.exit(os.EX_OK)
